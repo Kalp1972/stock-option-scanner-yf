@@ -8,20 +8,29 @@ import pandas_ta as ta
 st.set_page_config(page_title="Stock to Option Scanner", layout="wide")
 st.title("Stock Screener to Best Option Trade (yfinance)")
 
+# ------------------------------------------------------------------
+# WATCHLIST
+# ------------------------------------------------------------------
 WATCHLIST = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ITC.NS",
     "TATAMOTORS.NS", "MARUTI.NS", "SBIN.NS", "BHARTIARTL.NS", "LT.NS"
 ]
 
+# ------------------------------------------------------------------
+# FETCH & INDICATORS
+# ------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def get_stock_data(symbol, period="90d"):
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period)
-    if df.empty:
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period)
+        if df.empty or len(df) < 50:
+            return None
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        df.columns = [col.lower() for col in df.columns]
+        return df
+    except:
         return None
-    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    df.columns = [col.lower() for col in df.columns]
-    return df
 
 def add_indicators(df):
     df = df.copy()
@@ -34,12 +43,16 @@ def add_indicators(df):
     df['vol_surge'] = df['volume'] / df['vol_ma20']
     return df
 
+# ------------------------------------------------------------------
+# SCAN STOCKS
+# ------------------------------------------------------------------
 results = []
-with st.spinner("Scanning watchlist..."):
+with st.spinner("Scanning watchlist with Supertrend + RSI + Volume..."):
     for sym in WATCHLIST:
         try:
             df = get_stock_data(sym)
-            if df is None or len(df) < 50: continue
+            if df is None:
+                continue
             df = add_indicators(df)
             latest = df.iloc[-1]
             prev = df.iloc[-2]
@@ -73,76 +86,79 @@ with st.spinner("Scanning watchlist..."):
                 "RSI": f"{latest['rsi']:.1f}",
                 "Trend": "UP" if latest['st_dir'] == 1 else "DOWN",
                 "Signal": signal,
-                "Score": round(score, 1),
+                "Score": round(score, 1) if score > 0 else 0,
                 "Vol Surge": f"{latest['vol_surge']:.1f}x"
             })
-        except: continue
+        except Exception as e:
+            st.warning(f"Failed {sym}: {e}")
+            continue
 
-scan_df = pd.DataFrame(results).sort_values("Score", ascending=False)
+# ------------------------------------------------------------------
+# DISPLAY RESULTS SAFELY
+# ------------------------------------------------------------------
 st.subheader("Stock Scan Results")
-st.dataframe(scan_df, use_container_width=True)
 
-if not scan_df.empty:
-    top = scan_df.iloc[0]
-    st.success(f"**Top Pick: {top['Symbol']}** to {top['Signal']}")
-    underlying = top['Symbol'] + ".NS"
-    ticker = yf.Ticker(underlying)
-    expiries = ticker.options
-    if not expiries:
-        st.warning("No options available.")
-        st.stop()
+if not results:
+    st.warning("No stocks generated signals. Try lowering filters or check market hours (NSE: 9:15 AM – 3:30 PM IST).")
+    st.stop()
 
-    expiry = st.selectbox("Select Expiry", expiries)
-    
-    @st.cache_data(ttl=60)
-    def get_option_chain(symbol, date):
-        opt = yf.Ticker(symbol).option_chain(date)
-        calls = opt.calls.copy(); puts = opt.puts.copy()
-        calls['type'] = 'CE'; puts['type'] = 'PE'
-        chain = pd.concat([calls, puts])
+# Create DataFrame with default columns
+scan_df = pd.DataFrame(results, columns=[
+    "Symbol", "Close", "RSI", "Trend", "Signal", "Score", "Vol Surge"
+])
+
+# Sort only if Score exists and has values
+if "Score" in scan_df.columns and scan_df["Score"].sum() > 0:
+    scan_df = scan_df.sort_values("Score", ascending=False)
+
+st.dataframe(scan_df.reset_index(drop=True), use_container_width=True)
+
+# ------------------------------------------------------------------
+# OPTION CHAIN FOR TOP STOCK
+# ------------------------------------------------------------------
+top = scan_df.iloc[0]
+st.success(f"**Top Pick: {top['Symbol']}** to {top['Signal']}")
+
+underlying = top['Symbol'] + ".NS"
+ticker = yf.Ticker(underlying)
+
+expiries = ticker.options
+if not expiries:
+    st.error(f"No option chain for {top['Symbol']} on Yahoo Finance.")
+    st.stop()
+
+expiry = st.selectbox("Select Expiry", expiries, key="expiry_select")
+
+@st.cache_data(ttl=60)
+def get_option_chain(symbol, date):
+    try:
+        opt = ticker.option_chain(date)
+        calls = opt.calls.copy()
+        puts = opt.puts.copy()
+        calls['type'] = 'CE'
+        puts['type'] = 'PE'
+        chain = pd.concat([calls, puts], ignore_index=True)
         chain = chain[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility', 'type']]
         chain.columns = ['strike', 'ltp', 'bid', 'ask', 'volume', 'oi', 'iv', 'type']
         chain['ltp'] = chain[['ltp', 'bid', 'ask']].mean(axis=1)
+        chain = chain[chain['volume'] > 0]
         return chain
+    except:
+        return pd.DataFrame()
 
-    opt_df = get_option_chain(underlying, expiry)
-    if opt_df.empty:
-        st.warning("Empty chain.")
-        st.stop()
+opt_df = get_option_chain(underlying, expiry)
 
-    st.subheader(f"Option Chain: {top['Symbol']} ({expiry})")
-    strategy = st.radio("Strategy", ["Long Call", "Long Put", "Cash-Secured Put"], horizontal=True)
+if opt_df.empty:
+    st.warning("Option chain is empty or not loaded. Try another expiry.")
+    st.stop()
 
-    opt_df = opt_df[opt_df['volume'] > 0]
-    opt_df['liquidity'] = opt_df['volume'] + opt_df['oi'] * 0.1
-    opt_df['prem_iv'] = opt_df['ltp'] / (opt_df['iv'] + 1e-6)
+st.subheader(f"Option Chain: {top['Symbol']} ({expiry})")
 
-    candidates = opt_df.copy()
+strategy = st.radio("Strategy", ["Long Call", "Long Put", "Cash-Secured Put"], horizontal=True)
 
-    if strategy == "Long Call":
-        candidates = candidates[candidates["type"] == "CE"]
-        candidates["score"] = candidates["iv"] * 0.35 + candidates["liquidity"] * 0.3 + candidates["prem_iv"] * 0.2
-    elif strategy == "Long Put":
-        candidates = candidates[candidates["type"] == "PE"]
-        candidates["score"] = candidates["iv"] * 0.35 + candidates["liquidity"] * 0.3 + candidates["prem_iv"] * 0.2
-    else:
-        candidates = candidates[candidates["type"] == "PE"]
-        candidates["score"] = -candidates["iv"] * 0.4 + candidates["prem_iv"] * 0.4 + candidates["liquidity"] * 0.2
+opt_df['liquidity'] = opt_df['volume'] + opt_df['oi'] * 0.1
+opt_df['prem_iv'] = opt_df['ltp'] / (opt_df['iv'] + 1e-6)
 
-    best = candidates.sort_values("score", ascending=False).iloc[0]
-    st.success(f"**Best {strategy}: {best['type']} {best['strike']} @ ₹{best['ltp']:.2f}**")
+candidates = opt_df.copy()
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Premium", f"₹{best['ltp']:.2f}")
-        st.metric("IV", f"{best['iv']*100:.1f}%")
-    with col2:
-        st.metric("Volume", f"{int(best['volume']):,}")
-        st.metric("OI", f"{int(best['oi']):,}")
-    with col3:
-        st.metric("Bid", f"₹{best['bid']:.2f}")
-        st.metric("Ask", f"₹{best['ask']:.2f}")
-
-    spot = ticker.history(period="1d")['Close'].iloc[-1]
-    be = best['strike'] + best['ltp'] if best['type'] == "CE" else best['strike'] - best['ltp']
-    st.write(f"**Spot:** ₹{spot:.1f} | **Breakeven:** ₹{be:.1f}")
+if
