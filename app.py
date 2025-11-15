@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime
 import pandas_ta as ta
 
 st.set_page_config(page_title="Stock to Option Scanner", layout="wide")
@@ -17,7 +16,7 @@ WATCHLIST = [
 ]
 
 # ------------------------------------------------------------------
-# FETCH & INDICATORS
+# FETCH STOCK DATA
 # ------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def get_stock_data(symbol, period="90d"):
@@ -29,14 +28,17 @@ def get_stock_data(symbol, period="90d"):
         df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         df.columns = [col.lower() for col in df.columns]
         return df
-    except:
+    except Exception:
         return None
 
+# ------------------------------------------------------------------
+# ADD INDICATORS
+# ------------------------------------------------------------------
 def add_indicators(df):
     df = df.copy()
-    st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-    df['supertrend'] = st['SUPERT_10_3.0']
-    df['st_dir'] = st['SUPERTd_10_3.0']
+    st_data = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
+    df['supertrend'] = st_data['SUPERT_10_3.0']
+    df['st_dir'] = st_data['SUPERTd_10_3.0']
     df['rsi'] = ta.rsi(df['close'], length=14)
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
     df['vol_ma20'] = df['volume'].rolling(20).mean()
@@ -47,12 +49,12 @@ def add_indicators(df):
 # SCAN STOCKS
 # ------------------------------------------------------------------
 results = []
-with st.spinner("Scanning watchlist with Supertrend + RSI + Volume..."):
+with st.spinner("Scanning watchlist..."):
     for sym in WATCHLIST:
+        df = get_stock_data(sym)
+        if df is None:
+            continue
         try:
-            df = get_stock_data(sym)
-            if df is None:
-                continue
             df = add_indicators(df)
             latest = df.iloc[-1]
             prev = df.iloc[-2]
@@ -90,28 +92,21 @@ with st.spinner("Scanning watchlist with Supertrend + RSI + Volume..."):
                 "Vol Surge": f"{latest['vol_surge']:.1f}x"
             })
         except Exception as e:
-            st.warning(f"Failed {sym}: {e}")
+            st.warning(f"Error processing {sym}: {e}")
             continue
 
 # ------------------------------------------------------------------
-# DISPLAY RESULTS SAFELY
+# DISPLAY SCAN RESULTS
 # ------------------------------------------------------------------
 st.subheader("Stock Scan Results")
 
 if not results:
-    st.warning("No stocks generated signals. Try lowering filters or check market hours (NSE: 9:15 AM – 3:30 PM IST).")
+    st.warning("No signals found. Try during NSE market hours (9:15 AM – 3:30 PM IST).")
     st.stop()
 
-# Create DataFrame with default columns
-scan_df = pd.DataFrame(results, columns=[
-    "Symbol", "Close", "RSI", "Trend", "Signal", "Score", "Vol Surge"
-])
-
-# Sort only if Score exists and has values
-if "Score" in scan_df.columns and scan_df["Score"].sum() > 0:
-    scan_df = scan_df.sort_values("Score", ascending=False)
-
-st.dataframe(scan_df.reset_index(drop=True), use_container_width=True)
+scan_df = pd.DataFrame(results)
+scan_df = scan_df.sort_values("Score", ascending=False).reset_index(drop=True)
+st.dataframe(scan_df, use_container_width=True)
 
 # ------------------------------------------------------------------
 # OPTION CHAIN FOR TOP STOCK
@@ -143,13 +138,13 @@ def get_option_chain(symbol, date):
         chain['ltp'] = chain[['ltp', 'bid', 'ask']].mean(axis=1)
         chain = chain[chain['volume'] > 0]
         return chain
-    except:
+    except Exception:
         return pd.DataFrame()
 
 opt_df = get_option_chain(underlying, expiry)
 
 if opt_df.empty:
-    st.warning("Option chain is empty or not loaded. Try another expiry.")
+    st.warning("Option chain is empty. Try another expiry.")
     st.stop()
 
 st.subheader(f"Option Chain: {top['Symbol']} ({expiry})")
@@ -161,4 +156,38 @@ opt_df['prem_iv'] = opt_df['ltp'] / (opt_df['iv'] + 1e-6)
 
 candidates = opt_df.copy()
 
-if
+if strategy == "Long Call":
+    candidates = candidates[candidates["type"] == "CE"]
+    candidates["score"] = candidates["iv"] * 0.35 + candidates["liquidity"] * 0.3 + candidates["prem_iv"] * 0.2
+elif strategy == "Long Put":
+    candidates = candidates[candidates["type"] == "PE"]
+    candidates["score"] = candidates["iv"] * 0.35 + candidates["liquidity"] * 0.3 + candidates["prem_iv"] * 0.2
+else:  # Cash-Secured Put
+    candidates = candidates[candidates["type"] == "PE"]
+    candidates["score"] = -candidates["iv"] * 0.4 + candidates["prem_iv"] * 0.4 + candidates["liquidity"] * 0.2
+
+if candidates.empty:
+    st.warning("No valid options for this strategy.")
+    st.stop()
+
+best = candidates.sort_values("score", ascending=False).iloc[0]
+
+st.success(f"**Best {strategy}: {best['type']} {best['strike']} @ ₹{best['ltp']:.2f}**")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Premium", f"₹{best['ltp']:.2f}")
+    st.metric("IV", f"{best['iv']*100:.1f}%")
+with col2:
+    st.metric("Volume", f"{int(best['volume']):,}")
+    st.metric("OI", f"{int(best['oi']):,}")
+with col3:
+    st.metric("Bid", f"₹{best['bid']:.2f}")
+    st.metric("Ask", f"₹{best['ask']:.2f}")
+
+spot = ticker.history(period="1d")['Close'].iloc[-1]
+be = best['strike'] + best['ltp'] if best['type'] == "CE" else best['strike'] - best['ltp']
+st.write(f"**Spot:** ₹{spot:.1f} | **Breakeven:** ₹{be:.1f}")
+
+if st.checkbox("Show Full Ranked Options"):
+    st.dataframe(candidates.sort_values("score", ascending=False).round(4))
